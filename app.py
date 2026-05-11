@@ -75,10 +75,11 @@ if calculate_btn:
                 date_str = target_date.strftime("%Y-%m-%d")
                 unit_param = "&temperature_unit=fahrenheit" if temp_unit == "°F" else ""
                 
+                # THE FIX: Request a wide window (past 3 days, forward 14 days) to prevent timezone boundary NULLs
                 ens_url = (
                     f"https://ensemble-api.open-meteo.com/v1/ensemble?"
                     f"latitude={lat}&longitude={lon}&daily=temperature_2m_max&"
-                    f"timezone=auto&start_date={date_str}&end_date={date_str}"
+                    f"timezone=auto&past_days=3&forecast_days=14"
                     f"&models=ecmwf_ifs04,gfs_seamless{unit_param}"
                 )
                 
@@ -92,6 +93,7 @@ if calculate_btn:
                     st.error("❌ Invalid API response.")
                     st.stop()
 
+                # Find the exact index of the target date in the wide window array
                 try:
                     date_idx = ens_res["daily"]["time"].index(date_str)
                 except ValueError:
@@ -102,15 +104,18 @@ if calculate_btn:
                 ecmwf_temps = []
                 gfs_temps = []
                 
-                # Extract values for the specific date
+                # Extract values robustly
                 for key, values in daily_data.items():
-                    if "temperature_2m_max_member" in key:
+                    if "temperature_2m_max" in key and "member" in key:
                         val = values[date_idx]
                         if val is not None:
                             if "ecmwf" in key:
                                 ecmwf_temps.append(val)
                             elif "gfs" in key:
                                 gfs_temps.append(val)
+                            else:
+                                # Fallback if model name isn't clearly appended
+                                ecmwf_temps.append(val)
 
                 # Model Selection
                 if len(ecmwf_temps) >= 10:
@@ -120,20 +125,18 @@ if calculate_btn:
                     members_temps = gfs_temps
                     used_model = "GFS (USA) 🇺🇸"
                 else:
-                    st.error("❌ Models returned NULL. The day might have already ended in that timezone.")
+                    st.error(f"❌ Models returned NULL for {date_str}. (API may not have generated this data yet)")
                     st.stop()
 
                 total_members = len(members_temps)
                 mean_temp = sum(members_temps) / total_members
 
-                # --- NEW: Calculate Full Distribution ---
-                # Round temperatures to 1 decimal place to group them cleanly
+                # Calculate Full Distribution
                 rounded_temps = [round(t, 1) for t in members_temps]
                 unique_temps = sorted(list(set(rounded_temps)))
                 
                 distribution_data = []
                 for temp in unique_temps:
-                    # How many members predicted a max temp >= this threshold?
                     hits = sum(1 for t in members_temps if t >= temp)
                     prob = (hits / total_members) * 100
                     distribution_data.append({
@@ -156,14 +159,12 @@ if calculate_btn:
                 with c1:
                     st.subheader("📉 Probability Curve")
                     st.caption("Probability of reaching OR exceeding the temperature")
-                    # Prepare data for chart
                     chart_data = df.set_index(f"Temperature ({temp_unit})")
                     st.line_chart(chart_data)
                     
                 with c2:
                     st.subheader("📊 Data Table")
                     st.caption("Exact probabilities per threshold")
-                    # Display as a styled table without the index number
                     st.dataframe(
                         df.style.format({
                             f"Temperature ({temp_unit})": "{:.1f}", 
