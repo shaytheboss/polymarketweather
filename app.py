@@ -3,6 +3,7 @@ import requests
 import datetime
 import re
 import pandas as pd
+import math
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -12,14 +13,15 @@ st.set_page_config(
 )
 
 def parse_polymarket_url(url):
-    """Smart extractor to guess city from Polymarket URL"""
+    """Smart extractor to guess city and date from Polymarket URL"""
     city = None
+    target_date = None
     if not url:
-        return city
+        return city, target_date
         
     slug = url.split('/')[-1].lower()
     
-    # Extract City (e.g., will-austin-reach-90f...)
+    # 1. Extract City
     city_match = re.search(r'(?:will|in|at)-([a-z-]+)-reach', slug)
     if city_match:
         city = city_match.group(1).replace('-', ' ').upper()
@@ -28,7 +30,28 @@ def parse_polymarket_url(url):
         if fallback:
             city = fallback.group(1).upper()
             
-    return city
+    # 2. Extract Date (e.g., -on-may-12, -for-october-5)
+    month_names = {
+        'jan':1, 'january':1, 'feb':2, 'february':2, 'mar':3, 'march':3,
+        'apr':4, 'april':4, 'may':5, 'jun':6, 'june':6,
+        'jul':7, 'july':7, 'aug':8, 'august':8, 'sep':9, 'september':9,
+        'oct':10, 'october':10, 'nov':11, 'november':11, 'dec':12, 'december':12
+    }
+    
+    # Regex searches for a dash, followed by a month name, followed by a dash and 1-2 digits
+    date_match = re.search(r'-(' + '|'.join(month_names.keys()) + r')-(\d{1,2})\b', slug)
+    if date_match:
+        month_str = date_match.group(1)
+        day = int(date_match.group(2))
+        month = month_names[month_str]
+        current_year = datetime.date.today().year
+        
+        try:
+            target_date = datetime.date(current_year, month, day)
+        except ValueError:
+            pass # Ignore invalid dates like Feb 30
+            
+    return city, target_date
 
 st.title("🌤️ Weather Market Distribution")
 st.markdown("View probability distribution across **all** forecasted temperatures using Ensemble models.")
@@ -36,13 +59,13 @@ st.divider()
 
 # --- Input Form ---
 with st.container():
-    polymarket_url = st.text_input("🔗 Polymarket URL (Paste link to auto-fill city)", placeholder="https://polymarket.com/event/...")
+    polymarket_url = st.text_input("🔗 Polymarket URL (Paste link to auto-fill city & date)", placeholder="https://polymarket.com/event/...")
     
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         station_city = st.text_input("📍 Station / City (or leave empty if using URL)", placeholder="e.g., Austin or LAX")
     with col2:
-        target_date = st.date_input("📅 Target Date", datetime.date.today() + datetime.timedelta(days=1))
+        ui_target_date = st.date_input("📅 Target Date (Overridden by URL)", datetime.date.today() + datetime.timedelta(days=1))
     with col3:
         temp_unit = st.selectbox("Unit", ["°F", "°C"])
 
@@ -50,13 +73,21 @@ calculate_btn = st.button("Generate Probability Distribution", type="primary", u
 
 # --- Core Logic ---
 if calculate_btn:
-    parsed_city = parse_polymarket_url(polymarket_url)
+    parsed_city, parsed_date = parse_polymarket_url(polymarket_url)
+    
+    # URL values override manual UI inputs
     final_city = station_city if station_city else parsed_city
+    final_date = parsed_date if parsed_date else ui_target_date
 
     if not final_city:
         st.error("⚠️ Could not detect a city from the URL. Please enter the Station/City manually.")
     else:
-        with st.spinner(f"Fetching models and calculating distribution for {final_city}..."):
+        date_str = final_date.strftime("%Y-%m-%d")
+        
+        if parsed_date:
+            st.info(f"📅 Extracted date from link: **{date_str}**")
+            
+        with st.spinner(f"Fetching models and calculating distribution for {final_city} on {date_str}..."):
             try:
                 # Step 1: Geocoding
                 geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={final_city}&count=1&language=en&format=json"
@@ -72,10 +103,8 @@ if calculate_btn:
                 country = geo_res["results"][0].get("country", "")
 
                 # Step 2: Fetch Ensemble Data
-                date_str = target_date.strftime("%Y-%m-%d")
                 unit_param = "&temperature_unit=fahrenheit" if temp_unit == "°F" else ""
                 
-                # THE FIX: Request a wide window (past 3 days, forward 14 days) to prevent timezone boundary NULLs
                 ens_url = (
                     f"https://ensemble-api.open-meteo.com/v1/ensemble?"
                     f"latitude={lat}&longitude={lon}&daily=temperature_2m_max&"
@@ -93,7 +122,6 @@ if calculate_btn:
                     st.error("❌ Invalid API response.")
                     st.stop()
 
-                # Find the exact index of the target date in the wide window array
                 try:
                     date_idx = ens_res["daily"]["time"].index(date_str)
                 except ValueError:
@@ -104,7 +132,6 @@ if calculate_btn:
                 ecmwf_temps = []
                 gfs_temps = []
                 
-                # Extract values robustly
                 for key, values in daily_data.items():
                     if "temperature_2m_max" in key and "member" in key:
                         val = values[date_idx]
@@ -114,10 +141,8 @@ if calculate_btn:
                             elif "gfs" in key:
                                 gfs_temps.append(val)
                             else:
-                                # Fallback if model name isn't clearly appended
                                 ecmwf_temps.append(val)
 
-                # Model Selection
                 if len(ecmwf_temps) >= 10:
                     members_temps = ecmwf_temps
                     used_model = "ECMWF (Europe) 🌍"
@@ -131,29 +156,36 @@ if calculate_btn:
                 total_members = len(members_temps)
                 mean_temp = sum(members_temps) / total_members
 
-                # Calculate Full Distribution
-                rounded_temps = [round(t, 1) for t in members_temps]
-                unique_temps = sorted(list(set(rounded_temps)))
+                # --- NEW FIX: Generate an absolute range for realistic curve ---
+                min_t = min(members_temps)
+                max_t = max(members_temps)
+                
+                # Create a uniform scale: floor(min) - 1.5 to ceil(max) + 1.5 in 0.5 increments
+                start_t = math.floor(min_t * 2) / 2.0 - 1.5
+                end_t = math.ceil(max_t * 2) / 2.0 + 1.5
                 
                 distribution_data = []
-                for temp in unique_temps:
-                    hits = sum(1 for t in members_temps if t >= temp)
+                curr = start_t
+                while curr <= end_t:
+                    temp_val = round(curr, 1)
+                    # How many members predicted a max temp >= this exact threshold?
+                    hits = sum(1 for t in members_temps if t >= temp_val)
                     prob = (hits / total_members) * 100
+                    
                     distribution_data.append({
-                        f"Temperature ({temp_unit})": temp, 
+                        f"Temperature ({temp_unit})": temp_val, 
                         "Probability (%)": round(prob, 1)
                     })
+                    curr += 0.5
 
-                # Create Pandas DataFrame
                 df = pd.DataFrame(distribution_data)
 
                 # Step 3: Display Results
-                st.success(f"Generated from **{total_members}** ensemble runs for **{resolved_name}, {country}** ({used_model})")
+                st.success(f"Generated from **{total_members}** ensemble runs for **{resolved_name}, {country}** on **{date_str}**")
                 st.metric(label=f"Mean Expected Temperature", value=f"{mean_temp:.2f} {temp_unit}")
                 
                 st.divider()
                 
-                # Display Layout: Chart and Table side-by-side
                 c1, c2 = st.columns([1.5, 1])
                 
                 with c1:
