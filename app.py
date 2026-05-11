@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import datetime
 import re
+import pandas as pd
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -11,19 +12,13 @@ st.set_page_config(
 )
 
 def parse_polymarket_url(url):
-    """Smart extractor for Polymarket URLs"""
-    city, temp, unit = None, None, None
+    """Smart extractor to guess city from Polymarket URL"""
+    city = None
     if not url:
-        return city, temp, unit
+        return city
         
     slug = url.split('/')[-1].lower()
     
-    # Extract Temp (e.g., 80f, 25.5c)
-    t_match = re.search(r'(\d+(?:\.\d+)?)(f|c)\b', slug)
-    if t_match:
-        temp = float(t_match.group(1))
-        unit = "°F" if t_match.group(2) == 'f' else "°C"
-        
     # Extract City (e.g., will-austin-reach-90f...)
     city_match = re.search(r'(?:will|in|at)-([a-z-]+)-reach', slug)
     if city_match:
@@ -33,50 +28,42 @@ def parse_polymarket_url(url):
         if fallback:
             city = fallback.group(1).upper()
             
-    return city, temp, unit
+    return city
 
-st.title("🌤️ Weather Market Predictor")
-st.markdown("Calculate probability using **ECMWF & GFS Ensemble** models.")
+st.title("🌤️ Weather Market Distribution")
+st.markdown("View probability distribution across **all** forecasted temperatures using Ensemble models.")
 st.divider()
 
 # --- Input Form ---
 with st.container():
-    polymarket_url = st.text_input("🔗 Polymarket URL (Paste link here to auto-fill)", placeholder="https://polymarket.com/event/...")
+    polymarket_url = st.text_input("🔗 Polymarket URL (Paste link to auto-fill city)", placeholder="https://polymarket.com/event/...")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        station_city = st.text_input("📍 Station / City (Leave empty if using URL)", placeholder="e.g., Austin or LAX")
-        
-        tc1, tc2 = st.columns([2, 1])
-        with tc1:
-            target_temp = st.number_input("🌡️ Target Max Temp", value=25.0, step=0.1)
-        with tc2:
-            temp_unit = st.selectbox("Unit", ["°C", "°F"])
-            
+        station_city = st.text_input("📍 Station / City (or leave empty if using URL)", placeholder="e.g., Austin or LAX")
     with col2:
         target_date = st.date_input("📅 Target Date", datetime.date.today() + datetime.timedelta(days=1))
+    with col3:
+        temp_unit = st.selectbox("Unit", ["°F", "°C"])
 
-calculate_btn = st.button("Calculate Probability", type="primary", use_container_width=True)
+calculate_btn = st.button("Generate Probability Distribution", type="primary", use_container_width=True)
 
 # --- Core Logic ---
 if calculate_btn:
-    parsed_city, parsed_temp, parsed_unit = parse_polymarket_url(polymarket_url)
-    
+    parsed_city = parse_polymarket_url(polymarket_url)
     final_city = station_city if station_city else parsed_city
-    final_temp = parsed_temp if (polymarket_url and parsed_temp is not None) else target_temp
-    final_unit = parsed_unit if (polymarket_url and parsed_unit is not None) else temp_unit
 
     if not final_city:
         st.error("⚠️ Could not detect a city from the URL. Please enter the Station/City manually.")
     else:
-        with st.spinner(f"Fetching coordinates and running models for {final_city}..."):
+        with st.spinner(f"Fetching models and calculating distribution for {final_city}..."):
             try:
                 # Step 1: Geocoding
                 geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={final_city}&count=1&language=en&format=json"
                 geo_res = requests.get(geo_url).json()
                 
                 if "results" not in geo_res or len(geo_res["results"]) == 0:
-                    st.error(f"❌ Location '{final_city}' not found. Try a different name or airport code.")
+                    st.error(f"❌ Location '{final_city}' not found. Try a different name.")
                     st.stop()
                     
                 lat = geo_res["results"][0]["latitude"]
@@ -86,7 +73,7 @@ if calculate_btn:
 
                 # Step 2: Fetch Ensemble Data
                 date_str = target_date.strftime("%Y-%m-%d")
-                unit_param = "&temperature_unit=fahrenheit" if final_unit == "°F" else ""
+                unit_param = "&temperature_unit=fahrenheit" if temp_unit == "°F" else ""
                 
                 ens_url = (
                     f"https://ensemble-api.open-meteo.com/v1/ensemble?"
@@ -97,27 +84,25 @@ if calculate_btn:
                 
                 ens_res = requests.get(ens_url).json()
 
-                # Catch exact API errors from Open-Meteo
                 if ens_res.get("error"):
-                    st.error(f"❌ Open-Meteo API Error: {ens_res.get('reason')}")
+                    st.error(f"❌ API Error: {ens_res.get('reason')}")
                     st.stop()
 
                 if "daily" not in ens_res or "time" not in ens_res["daily"]:
-                    st.error("❌ Could not fetch ensemble data. The API returned an empty or invalid response.")
+                    st.error("❌ Invalid API response.")
                     st.stop()
 
-                # Ensure the exact date exists in the returned array
                 try:
                     date_idx = ens_res["daily"]["time"].index(date_str)
                 except ValueError:
-                    st.error(f"❌ Date {date_str} is not available in the model's output window.")
+                    st.error(f"❌ Date {date_str} is not available in the forecast window.")
                     st.stop()
 
                 daily_data = ens_res["daily"]
                 ecmwf_temps = []
                 gfs_temps = []
                 
-                # Safely extract values for the specific date index
+                # Extract values for the specific date
                 for key, values in daily_data.items():
                     if "temperature_2m_max_member" in key:
                         val = values[date_idx]
@@ -126,39 +111,67 @@ if calculate_btn:
                                 ecmwf_temps.append(val)
                             elif "gfs" in key:
                                 gfs_temps.append(val)
-                            else:
-                                # Fallback if API drops suffixes
-                                ecmwf_temps.append(val)
 
-                # Model Selection Logic
+                # Model Selection
                 if len(ecmwf_temps) >= 10:
                     members_temps = ecmwf_temps
                     used_model = "ECMWF (Europe) 🌍"
                 elif len(gfs_temps) > 0:
                     members_temps = gfs_temps
                     used_model = "GFS (USA) 🇺🇸"
-                elif len(ecmwf_temps) > 0:
-                    members_temps = ecmwf_temps
-                    used_model = "Default Ensemble"
                 else:
-                    st.error("❌ Models returned NULL for this specific date. The day might have already started/ended in that timezone, so forecasting is disabled.")
+                    st.error("❌ Models returned NULL. The day might have already ended in that timezone.")
                     st.stop()
 
                 total_members = len(members_temps)
-                hits = sum(1 for temp in members_temps if temp >= final_temp)
-                probability = (hits / total_members) * 100
                 mean_temp = sum(members_temps) / total_members
 
-                # Display Results
-                st.success(f"Analysis complete for **{resolved_name}, {country}** using {used_model}")
-                st.info(f"🎯 Target Rule: Will it hit **{final_temp}{final_unit}** or higher on **{date_str}**?")
+                # --- NEW: Calculate Full Distribution ---
+                # Round temperatures to 1 decimal place to group them cleanly
+                rounded_temps = [round(t, 1) for t in members_temps]
+                unique_temps = sorted(list(set(rounded_temps)))
                 
-                m1, m2, m3 = st.columns(3)
-                m1.metric(label="Probability", value=f"{probability:.1f}%")
-                m2.metric(label="Mean Expected", value=f"{mean_temp:.1f} {final_unit}")
-                m3.metric(label="Models Run", value=total_members)
+                distribution_data = []
+                for temp in unique_temps:
+                    # How many members predicted a max temp >= this threshold?
+                    hits = sum(1 for t in members_temps if t >= temp)
+                    prob = (hits / total_members) * 100
+                    distribution_data.append({
+                        f"Temperature ({temp_unit})": temp, 
+                        "Probability (%)": round(prob, 1)
+                    })
+
+                # Create Pandas DataFrame
+                df = pd.DataFrame(distribution_data)
+
+                # Step 3: Display Results
+                st.success(f"Generated from **{total_members}** ensemble runs for **{resolved_name}, {country}** ({used_model})")
+                st.metric(label=f"Mean Expected Temperature", value=f"{mean_temp:.2f} {temp_unit}")
                 
-                st.progress(probability / 100.0)
+                st.divider()
+                
+                # Display Layout: Chart and Table side-by-side
+                c1, c2 = st.columns([1.5, 1])
+                
+                with c1:
+                    st.subheader("📉 Probability Curve")
+                    st.caption("Probability of reaching OR exceeding the temperature")
+                    # Prepare data for chart
+                    chart_data = df.set_index(f"Temperature ({temp_unit})")
+                    st.line_chart(chart_data)
+                    
+                with c2:
+                    st.subheader("📊 Data Table")
+                    st.caption("Exact probabilities per threshold")
+                    # Display as a styled table without the index number
+                    st.dataframe(
+                        df.style.format({
+                            f"Temperature ({temp_unit})": "{:.1f}", 
+                            "Probability (%)": "{:.1f}%"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
 
             except Exception as e:
                 st.error(f"An unexpected Python error occurred: {e}")
