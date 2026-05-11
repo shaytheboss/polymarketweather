@@ -11,7 +11,7 @@ st.set_page_config(
 )
 
 def parse_polymarket_url(url):
-    """Smart extractor to guess city, temperature and unit from Polymarket URL slug"""
+    """Smart extractor for Polymarket URLs"""
     city, temp, unit = None, None, None
     if not url:
         return city, temp, unit
@@ -19,17 +19,16 @@ def parse_polymarket_url(url):
     slug = url.split('/')[-1].lower()
     
     # Extract Temp (e.g., 80f, 25.5c)
-    temp_match = re.search(r'(\d+(?:\.\d+)?)(f|c)\b', slug)
-    if temp_match:
-        temp = float(temp_match.group(1))
-        unit = "°F" if temp_match.group(2) == 'f' else "°C"
+    t_match = re.search(r'(\d+(?:\.\d+)?)(f|c)\b', slug)
+    if t_match:
+        temp = float(t_match.group(1))
+        unit = "°F" if t_match.group(2) == 'f' else "°C"
         
-    # Extract City (looks for "in-lax", "at-new-york", etc.)
-    city_match = re.search(r'(?:in|at)-([a-z]+(?:-[a-z]+)*?)(?:-reach|-be|-on|-and|-will|\d)', slug)
+    # Extract City (e.g., will-austin-reach-90f...)
+    city_match = re.search(r'(?:will|in|at)-([a-z-]+)-reach', slug)
     if city_match:
         city = city_match.group(1).replace('-', ' ').upper()
     else:
-        # Fallback city extraction
         fallback = re.search(r'(?:in|at)-([a-z]+)', slug)
         if fallback:
             city = fallback.group(1).upper()
@@ -46,9 +45,8 @@ with st.container():
     
     col1, col2 = st.columns(2)
     with col1:
-        station_city = st.text_input("📍 Station / City (Leave empty if using URL)", placeholder="e.g., LAX or London")
+        station_city = st.text_input("📍 Station / City (Leave empty if using URL)", placeholder="e.g., Austin or LAX")
         
-        # Temp and Unit row
         tc1, tc2 = st.columns([2, 1])
         with tc1:
             target_temp = st.number_input("🌡️ Target Max Temp", value=25.0, step=0.1)
@@ -62,20 +60,18 @@ calculate_btn = st.button("Calculate Probability", type="primary", use_container
 
 # --- Core Logic ---
 if calculate_btn:
-    # 1. Parse URL if provided
     parsed_city, parsed_temp, parsed_unit = parse_polymarket_url(polymarket_url)
     
-    # 2. Determine final variables (URL overrides manual if manual is empty/default)
     final_city = station_city if station_city else parsed_city
-    final_temp = parsed_temp if (polymarket_url and parsed_temp) else target_temp
-    final_unit = parsed_unit if (polymarket_url and parsed_unit) else temp_unit
+    final_temp = parsed_temp if (polymarket_url and parsed_temp is not None) else target_temp
+    final_unit = parsed_unit if (polymarket_url and parsed_unit is not None) else temp_unit
 
     if not final_city:
         st.error("⚠️ Could not detect a city from the URL. Please enter the Station/City manually.")
     else:
         with st.spinner(f"Fetching coordinates and running models for {final_city}..."):
             try:
-                # Step 1: Geocoding (City name to Lat/Lon)
+                # Step 1: Geocoding
                 geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={final_city}&count=1&language=en&format=json"
                 geo_res = requests.get(geo_url).json()
                 
@@ -88,7 +84,7 @@ if calculate_btn:
                 resolved_name = geo_res["results"][0]["name"]
                 country = geo_res["results"][0].get("country", "")
 
-                # Step 2: Fetch Ensemble Data (Both ECMWF and GFS to prevent LAX bug)
+                # Step 2: Fetch Ensemble Data
                 date_str = target_date.strftime("%Y-%m-%d")
                 unit_param = "&temperature_unit=fahrenheit" if final_unit == "°F" else ""
                 
@@ -101,36 +97,54 @@ if calculate_btn:
                 
                 ens_res = requests.get(ens_url).json()
 
-                if "daily" not in ens_res:
-                    st.error("❌ Could not fetch ensemble data. The date might be too far in the future or past.")
+                # Catch exact API errors from Open-Meteo
+                if ens_res.get("error"):
+                    st.error(f"❌ Open-Meteo API Error: {ens_res.get('reason')}")
+                    st.stop()
+
+                if "daily" not in ens_res or "time" not in ens_res["daily"]:
+                    st.error("❌ Could not fetch ensemble data. The API returned an empty or invalid response.")
+                    st.stop()
+
+                # Ensure the exact date exists in the returned array
+                try:
+                    date_idx = ens_res["daily"]["time"].index(date_str)
+                except ValueError:
+                    st.error(f"❌ Date {date_str} is not available in the model's output window.")
                     st.stop()
 
                 daily_data = ens_res["daily"]
                 ecmwf_temps = []
                 gfs_temps = []
                 
-                # Separate models
-                for key, value in daily_data.items():
-                    if value and len(value) > 0 and value[0] is not None:
-                        if "ecmwf_ifs04" in key:
-                            ecmwf_temps.append(value[0])
-                        elif "gfs_seamless" in key:
-                            gfs_temps.append(value[0])
+                # Safely extract values for the specific date index
+                for key, values in daily_data.items():
+                    if "temperature_2m_max_member" in key:
+                        val = values[date_idx]
+                        if val is not None:
+                            if "ecmwf" in key:
+                                ecmwf_temps.append(val)
+                            elif "gfs" in key:
+                                gfs_temps.append(val)
+                            else:
+                                # Fallback if API drops suffixes
+                                ecmwf_temps.append(val)
 
-                # Use ECMWF if available, fallback to GFS if ECMWF is empty
-                if len(ecmwf_temps) > 0:
+                # Model Selection Logic
+                if len(ecmwf_temps) >= 10:
                     members_temps = ecmwf_temps
-                    used_model = "ECMWF (Europe)"
+                    used_model = "ECMWF (Europe) 🌍"
                 elif len(gfs_temps) > 0:
                     members_temps = gfs_temps
-                    used_model = "GFS (USA) - Fallback"
+                    used_model = "GFS (USA) 🇺🇸"
+                elif len(ecmwf_temps) > 0:
+                    members_temps = ecmwf_temps
+                    used_model = "Default Ensemble"
                 else:
-                    st.error("❌ No ensemble data available for this date. (If the date is today or in the past, forecasts are no longer generated).")
+                    st.error("❌ Models returned NULL for this specific date. The day might have already started/ended in that timezone, so forecasting is disabled.")
                     st.stop()
 
                 total_members = len(members_temps)
-                
-                # Calculate hits
                 hits = sum(1 for temp in members_temps if temp >= final_temp)
                 probability = (hits / total_members) * 100
                 mean_temp = sum(members_temps) / total_members
@@ -147,4 +161,4 @@ if calculate_btn:
                 st.progress(probability / 100.0)
 
             except Exception as e:
-                st.error(f"An unexpected error occurred: {e}")
+                st.error(f"An unexpected Python error occurred: {e}")
